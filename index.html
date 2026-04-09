@@ -142,7 +142,7 @@
 <script>
 // ========== 配置 ==========
 const API = 'https://fapi.binance.com';
-const CORS_PROXY = 'https://corsproxy.io/?';
+const PROXY = 'https://bian-api-proxy-2ywg.vercel.app/';
 const BATCH = 10;
 let busy = false;
 
@@ -154,24 +154,16 @@ const fc = n => n >= 0 ? `<span class="up">+${fmt(n)}%</span>` : `<span class="d
 const err = msg => { $('err').textContent = msg; $('err').style.display = 'block'; setTimeout(() => $('err').style.display = 'none', 5000); };
 const setProgress = (pct, text) => { $('bar').style.width = pct + '%'; $('bar').textContent = pct + '%'; if (text) $('status').textContent = text; };
 
-// ========== API请求 (支持CORS代理) ==========
+// ========== API请求 (使用代理) ==========
 async function apiFetch(path) {
-    const url = API + path;
+    const targetUrl = API + path;
+    const proxyUrl = PROXY + '?url=' + encodeURIComponent(targetUrl);
     const ctrl = new AbortController();
     const id = setTimeout(() => ctrl.abort(), 20000);
-    try {
-        // 先尝试直连
-        const r = await window.fetch(url, { signal: ctrl.signal, mode: 'cors' });
-        clearTimeout(id);
-        if (r.ok) return await r.json();
-    } catch (e) {}
-    
-    // 直连失败，用CORS代理
+    const r = await window.fetch(proxyUrl, { signal: ctrl.signal });
     clearTimeout(id);
-    const proxyUrl = CORS_PROXY + encodeURIComponent(url);
-    const r2 = await window.fetch(proxyUrl, { signal: AbortController.timeout(20000) });
-    if (!r2.ok) throw new Error('HTTP ' + r2.status);
-    return await r2.json();
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
 }
 
 // ========== 技术指标库 (增强版) ==========
