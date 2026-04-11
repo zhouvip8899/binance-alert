@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>币安合约暴涨预警系统 v3.20</title>
+    <title>币安合约暴涨预警系统 v3.21</title>
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
         body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;background:linear-gradient(135deg,#0f0f1a,#1a1a2e);min-height:100vh;color:#e0e0e0}
@@ -169,18 +169,43 @@ let busy = false;
 const $ = id => document.getElementById(id);
 const fmt = (n, d = 2) => (isNaN(n) || n === null || n === undefined) ? '-' : Number(n).toFixed(d);
 const fv = v => v > 1e9 ? (v / 1e9).toFixed(1) + 'B' : v > 1e6 ? (v / 1e6).toFixed(1) + 'M' : (v / 1e3).toFixed(1) + 'K';
-const fc = n => {
-    if (n === null || n === undefined || isNaN(n)) return '<span class="down">-</span>';
-    return n >= 0 ? `<span class="up">+${fmt(n)}%</span>` : `<span class="down">${fmt(n)}%</span>`;
-};
+const fc = n => (n === null || n === undefined || isNaN(n)) ? '<span class="down">-</span>' : (n >= 0 ? `<span class="up">+${fmt(n)}%</span>` : `<span class="down">${fmt(n)}%</span>`);
 const err = msg => { $('err').textContent = msg; $('err').style.display = 'block'; setTimeout(() => $('err').style.display = 'none', 10000); };
-const setProgress = (pct, text) => { 
-    if ($('bar')) { $('bar').style.width = pct + '%'; $('bar').textContent = pct + '%'; }
-    if (text && $('status')) $('status').textContent = text; 
-};
-// 安全获取数组最小值（避免栈溢出）
+const setProgress = (pct, text) => { $('bar') && ($('bar').style.width = pct + '%', $('bar').textContent = pct + '%'); text && $('status') && ($('status').textContent = text); };
 const safeMin = arr => arr.reduce((a, b) => a < b ? a : b, Infinity);
 const safeMax = arr => arr.reduce((a, b) => a > b ? a : b, -Infinity);
+
+// ========== 公共计算函数 ==========
+// 统一的takerBuyRatio计算（避免多处重复）
+const calcTakerRatio = (t) => {
+    const takerBuyVol = parseFloat(t.takerBuyQuoteAssetVolume) || 0;
+    const totalVol = parseFloat(t.quoteVolume) || 1;
+    const priceChg = parseFloat(t.priceChangePercent) || 0;
+    // 优先用真实数据，否则用涨跌幅估算
+    if (takerBuyVol > 0) return Math.min(Math.max(takerBuyVol / totalVol, 0.1), 0.9);
+    return priceChg > 0 ? 0.54 : 0.46;
+};
+// 统一的whaleLongShortRatio计算
+const calcWhaleRatio = (takerRatio) => 0.3 + takerRatio * 1.7;
+// 指标箭头
+const getArrow = (val, type) => {
+    const n = parseFloat(val) || 0;
+    if (type === 'rsi') return n > 55 ? '🔴' : (n < 35 ? '🟢' : '');
+    if (type === 'kdj') return n > 80 ? '🔴' : (n < 20 ? '🟢' : '');
+    if (type === 'cci') return n > 100 ? '🔴' : (n < -100 ? '🟢' : '');
+    return '';
+};
+// 标签样式
+const tagClass = s => s.includes('⚠️') ? 'tag-r' : (s.includes('🐋') || s.includes('🦈') ? 'tag-whale' : '');
+// 评分样式映射
+const LEVEL_CLASS = { '🚀暴涨预警': 's-h', '⚡积累中': 's-w', '👀观察中': 's-c' };
+// 卡片配置
+const CARD_CONFIG = {
+    rebound: { border: '#00e676', label: '🔼反弹', scoreClass: 's-h' },
+    crash: { border: '#ef5350', label: '', scoreClass: 's-crash' },
+    hotTrend: { border: '#ff9800', label: '🔥HOT', scoreClass: 's-hot' },
+    whale: { border: '#00bcd4', label: '', scoreClass: 's-whale' }
+};
 
 // ========== API请求 (VPN优先直连，失败自动切换代理) ==========
 async function apiFetch(path) {
@@ -661,269 +686,116 @@ const TA = {
     }
 };
 
-// ========== 评分系统 v3.20 (全信号共振版) ==========
-// 核心：量价背离 + 多周期共振 + 趋势加速 + 智能过滤 + 波动率检测 + 均线金叉 + OBV + 市场情绪
+// ========== 评分系统 v3.21 (精简版) ==========
+// 核心：三维共振 - 技术面×2 + 资金面 + 大户面
 function score(d) {
     let s = 0, sig = [], level = '中性', isBottomRebound = false, isWatch = false, isCrash = false, crashSignals = 0;
     const fromLow = d.fromLow || 0;
-    const core = { tech: 0, fund: 0, whale: 0 };  // 三维核心信号
+    const core = { tech: 0, fund: 0, whale: 0 };
+    const taker = d.takerBuyRatio || 0.5;
+    const whale = d.whaleLongShortRatio || 1;
     
-    // ========== 1. 暴跌检测 (精准严格 + 智能过滤) ==========
+    // ========== 1. 暴跌检测 ==========
     const severeCrash = d.chg4h <= -10 || d.chg24h <= -18;
     const moderateCrash = d.chg4h <= -6 || d.chg24h <= -12;
     
-    if (severeCrash) {
-        crashSignals += 5;
-        const chg = d.chg4h <= -10 ? d.chg4h : d.chg24h;
-        sig.push(`💥暴跌${Math.abs(chg).toFixed(1)}%`);
-    } else if (moderateCrash) {
-        crashSignals += 3;
-        const chg = d.chg4h <= -6 ? d.chg4h : d.chg24h;
-        sig.push(`📉下跌${Math.abs(chg).toFixed(1)}%`);
-    }
+    if (severeCrash) { crashSignals += 5; sig.push(`💥暴跌${Math.abs(d.chg4h <= -10 ? d.chg4h : d.chg24h).toFixed(1)}%`); }
+    else if (moderateCrash) { crashSignals += 3; sig.push(`📉下跌${Math.abs(d.chg4h <= -6 ? d.chg4h : d.chg24h).toFixed(1)}%`); }
     
-    // 暴跌确认指标
+    // 暴跌确认
     if (crashSignals >= 3) {
         if (d.rsi > 70) { crashSignals += 2; sig.push('⚠️RSI高位'); }
         if (d.kdj?.j > 85) { crashSignals += 2; sig.push('⚠️KDJ超买'); }
-        if (d.macd && d.macd.hist < 0) { crashSignals += 1; }
+        if (d.macd?.hist < 0) crashSignals++;
         if (d.cci > 120) { crashSignals += 1; sig.push('⚠️CCI极端'); }
     }
+    if (crashSignals >= 2 && d.mom < -5) { crashSignals += 1; sig.push('⚡动量加速'); }
+    if (d.fr < -0.01) { crashSignals += 1; sig.push('💸费率做空'); }
+    // 智能暴跌过滤：跌幅大但无量
+    if (crashSignals >= 4 && d.vr < 0.8) { crashSignals -= 1; sig.push('⚠️无量暴跌'); }
+    if (crashSignals >= 5) return { s: 70 + crashSignals * 2, sig: sig.slice(0, 6), level: '💎暴跌预警', isBottomRebound, isWatch, isCrash: true, crashSignals };
     
-    // 下跌趋势确认（v3.16新增）
-    if (crashSignals >= 2) {
-        // 均线空头排列
-        if (d.ma && d.ma.ma5 < d.ma.ma20) { crashSignals += 1; sig.push('📉MA空头'); }
-        // 动量加速下跌
-        if (d.chg1h < d.chg4h * 0.5 && d.chg1h < -2) { crashSignals += 1; sig.push('⚡加速下跌'); }
-        // 资金费率下降
-        if (d.fr < -0.01) { crashSignals += 1; sig.push('💸费率做空'); }
-    }
-    
-    // === v3.16 优化：智能暴跌过滤 ===
-    // 跌幅大但无量 = 可能虚假信号，降权
-    if (crashSignals >= 4) {
-        if (d.vr < 0.8) { 
-            crashSignals -= 1; // 严重无量下跌
-            sig.push('⚠️无量暴跌'); 
-        }
-    }
-    
-    if (crashSignals >= 5) {
-        isCrash = true;
-        level = '💎暴跌预警';
-        return { s: 70 + crashSignals * 2, sig: sig.slice(0, 6), level, isBottomRebound, isWatch, isCrash, crashSignals };
-    }
-    
-    // ========== 2. 底部反弹 (v3.19 优化：多层阈值 + WR背离) ==========
+    // ========== 2. 底部反弹 (v3.19 多层阈值) ==========
     if (fromLow > 2 && fromLow < 25) {
         let reboundScore = 0;
-        
-        // 超卖指标（分两级：极端 + 一般）
+        // 超卖指标（极端/一般 两级）
         if (d.rsi < 35) { reboundScore += 3; sig.push('📊RSI超卖'); }
-        else if (d.rsi < 40) { reboundScore += 1; }
+        else if (d.rsi < 40) reboundScore++;
         if (d.kdj?.j < 20) { reboundScore += 2; sig.push('📊KDJ超卖'); }
-        else if (d.kdj?.j < 30) { reboundScore += 1; }
+        else if (d.kdj?.j < 30) reboundScore++;
         if (d.bb?.pos < 15) { reboundScore += 2; sig.push('📊布林超卖'); }
-        else if (d.bb?.pos < 25) { reboundScore += 1; }
+        else if (d.bb?.pos < 25) reboundScore++;
         if (d.wr !== null && d.wr < -90) { reboundScore += 2; sig.push('📊WR超卖'); }
-        else if (d.wr !== null && d.wr < -80) { reboundScore += 1; }
+        else if (d.wr !== null && d.wr < -80) reboundScore++;
         if (d.cci < -150) { reboundScore += 2; sig.push('📊CCI超卖'); }
-        else if (d.cci < -100) { reboundScore += 1; }
-        
+        else if (d.cci < -100) reboundScore++;
         // 反弹确认
-        if (d.macd && d.macd.hist > 0) { reboundScore += 2; sig.push('💹MACD转多'); }
-        if (d.vr >= 1.3) { reboundScore += 1; }
-        if (d.chg1h > 0) { reboundScore += 1; }
+        if (d.macd?.hist > 0) { reboundScore += 2; sig.push('💹MACD转多'); }
+        if (d.vr >= 1.3) reboundScore++;
+        if (d.chg1h > 0) reboundScore++;
+        // 底背离
+        if (d.divergence === 'bottom') { reboundScore += 3; sig.push('📈底背离确认'); }
+        // 多周期共振
+        if (d.mtf?.aligned && d.mtf?.direction === 'up') { reboundScore += 2; sig.push('🔄多周期共振'); }
+        if (d.wrDiv === 'bottom') { reboundScore += 2; sig.push('📊WR底背离'); }
         
-        // 底背离确认
-        if (d.divergence === 'bottom') {
-            reboundScore += 3;
-            sig.push('📈底背离确认');
-        }
-        
-        // 多周期共振反弹
-        if (d.mtf?.aligned && d.mtf?.direction === 'up') {
-            reboundScore += 2;
-            sig.push('🔄多周期共振');
-        }
-        
-        // WR底背离（v3.19新增）
-        if (d.wrDiv === 'bottom') {
-            reboundScore += 2;
-            sig.push('📊WR底背离');
-        }
-        
-        if (reboundScore >= 5) {
-            isBottomRebound = true;
-            return { s: 20 + reboundScore * 2, sig: sig.slice(0, 7), level: '🔼底部反弹', isBottomRebound, isWatch, isCrash, crashSignals };
-        }
+        if (reboundScore >= 5) return { s: 20 + reboundScore * 2, sig: sig.slice(0, 7), level: '🔼底部反弹', isBottomRebound: true, isWatch, isCrash, crashSignals };
     }
     
-    // ========== 3. 暴涨信号 (精准共振 + 严格筛选) ==========
-    // ---- A. 技术面核心 (权重2x) ----
-    
-    // 布林带收口 (关键突破前兆) - 收紧
+    // ========== 3. 暴涨信号 (三维共振) ==========
+    // 技术面核心 (权重2x)
     if (d.bb?.w < 3) { core.tech += 2; s += 18; sig.push('📊布林收口'); }
     else if (d.bb?.w < 5) { core.tech++; s += 10; sig.push('📊布林收敛'); }
-    
-    // MACD金叉 (趋势转折) - 收紧
-    if (d.macd && d.macd.hist > 0.5) { core.tech += 2; s += 15; sig.push('💹MACD金叉'); }
-    else if (d.macd && d.macd.hist > 0.2) { core.tech++; s += 8; sig.push('💹MACD转多'); }
-    
-    // 成交量爆发 (动力来源) - 收紧
+    if (d.macd?.hist > 0.5) { core.tech += 2; s += 15; sig.push('💹MACD金叉'); }
+    else if (d.macd?.hist > 0.2) { core.tech++; s += 8; sig.push('💹MACD转多'); }
     if (d.vr >= 2.0) { core.tech += 2; s += 15; sig.push(`🔥量能${d.vr.toFixed(1)}x`); }
-    else if (d.vr >= 1.5) { core.tech++; s += 8; sig.push(`🔥温和放量`); }
-    
-    // RSI健康区间 - 收紧
+    else if (d.vr >= 1.5) { core.tech++; s += 8; sig.push('🔥温和放量'); }
     if (d.rsi >= 42 && d.rsi <= 58) { core.tech++; s += 8; sig.push('📊RSI健康'); }
-    
-    // 动量强劲
     if (d.mom > 4) { core.tech++; s += 6; sig.push('💨动量充足'); }
-    
-    // KDJ金叉共振 - 收紧
     if (d.kdj?.j > 55) { s += 5; sig.push('💹KDJ转多'); }
     
-    // ---- B. 资金流向 (权重1x) ----
-    const taker = d.takerBuyRatio || 0;
-    if (taker >= 0.58) { 
-        core.fund += 2; s += 12; 
-        sig.push(`🟢Taker买入${(taker * 100).toFixed(0)}%`); 
-    } else if (taker >= 0.55) {
-        core.fund++; s += 6;
-    }
-    
-    // 费率优惠
+    // 资金面 (权重1x)
+    if (taker >= 0.58) { core.fund += 2; s += 12; sig.push(`🟢Taker买入${(taker * 100).toFixed(0)}%`); }
+    else if (taker >= 0.55) { core.fund++; s += 6; }
     if (d.fr < 0 && d.fr >= -0.015) { core.fund++; s += 5; sig.push('💸费率优惠'); }
-    else if (d.fr <= 0.008 && d.fr >= 0) { s += 3; }
     
-    // ---- C. 大户信号 (权重1x) ----
-    const whale = d.whaleLongShortRatio || 1;
+    // 大户面 (权重1x)
     if (whale >= 1.5) { core.whale += 2; s += 15; sig.push(`🐋大户做多${whale.toFixed(2)}x`); }
     else if (whale >= 1.3) { core.whale++; s += 8; sig.push(`🐋略偏多${whale.toFixed(2)}x`); }
     
-    // ---- D. 趋势确认 (不重复加分) - 收紧 ----
+    // 趋势确认
     const maxChg = Math.max(d.chg4h, d.chg1h, d.chg24h / 4);
-    if (maxChg >= 10) { s += 8; sig.push(`🚀强势上涨+${maxChg.toFixed(1)}%`); }
-    else if (maxChg >= 6) { s += 5; }
-    else if (maxChg >= 3) { s += 3; }
+    if (maxChg >= 10) { s += 8; sig.push(`🚀强势+${maxChg.toFixed(1)}%`); }
+    else if (maxChg >= 6) s += 5;
+    else if (maxChg >= 3) s += 3;
+    if (d.ma7 && d.ma25 && d.ma99 && d.ma7 > d.ma25 && d.ma25 > d.ma99) { s += 6; sig.push('📈均线多头'); }
+    else if (d.ma7 && d.ma25 && d.ma7 > d.ma25) s += 2;
     
-    // 均线多头 - 收紧
-    if (d.ma7 && d.ma25 && d.ma99 && d.ma7 > d.ma25 && d.ma25 > d.ma99) {
-        s += 6; sig.push('📈均线多头');
-    } else if (d.ma7 && d.ma25 && d.ma7 > d.ma25) { s += 2; }
-    
-    // ---- E. v3.15 新增：量价背离检测 - 严格 ----
-    if (d.divergence === 'top') {
-        s -= 12; // 顶背离预警，更严格降分
-        sig.push('⚠️顶背离预警');
-    } else if (d.divergence === 'bottom' && !isBottomRebound) {
-        s += 10; // 底背离但未反弹，可能是蓄力
-        sig.push('📊底背离蓄力');
-    }
-    
-    // ---- F. v3.15 新增：多周期共振 - 收紧 ----
-    if (d.mtf?.aligned && d.mtf?.direction === 'up') {
-        core.tech += 2;
-        s += 15;
-        sig.push('🔄多周期看多');
-    } else if (d.mtf?.aligned && d.mtf?.direction === 'down') {
-        s -= 10;
-        sig.push('🔄多周期看空');
-    }
-    
-    // ---- G. v3.15 新增：趋势加速识别 - 收紧 ----
-    if (d.trendAccel?.strongTrend && d.trendAccel?.bullish) {
-        core.tech += 1;
-        s += 12;
-        sig.push('💥主升浪形成');
-    } else if (d.trendAccel?.accelerating && d.trendAccel?.bullish) {
-        s += 8;
-        sig.push('🚀趋势加速中');
-    }
-    
-    // ---- H. v3.15 新增：波动率爆发 - 收紧 ----
-    if (d.volBreakout?.breakout && d.volBreakout?.volConfirmed) {
-        core.tech += 2;
-        s += 18;
-        sig.push(`📊波动率爆发${d.volBreakout.atrRatio.toFixed(1)}x`);
-    } else if (d.volBreakout?.breakout) {
-        s += 10;
-        sig.push('⚡波动率放大');
-    }
-    
-    // ---- I. v3.15 智能暴涨过滤 - 更严格 ----
-    // 涨幅大但无量 = 虚假信号
-    if (maxChg > 8 && d.vr < 1.3) {
-        s -= 12;
-        sig.push('⚠️虚涨风险');
-    }
-    // 涨幅大 + 有量 = 真实信号增强
-    if (maxChg > 6 && d.vr >= 1.8) {
-        s += 6;
-        sig.push('✅量价配合');
-    }
-    
-    // ---- K. v3.16 新增：均线金叉共振 - 收紧 ----
-    if (d.maCross?.goldenCross) {
-        core.tech += 2;
-        s += 15;
-        sig.push('🌟均线金叉共振');
-    } else if (d.maCross?.bullish && d.maCross.strength > 2) {
-        s += 8;
-        sig.push('📈均线多头排列');
-    }
-    
-    // ---- L. v3.16 新增：MACD柱状图加速 - 收紧 ----
-    if (d.macdAccel?.accelerating) {
-        core.tech += 1;
-        s += 12;
-        sig.push('💫MACD柱加速');
-    }
-    
-    // ---- M. v3.16 新增：OBV能量潮背离 - 严格 ----
-    if (d.obvDiv === 'top') {
-        s -= 10;
-        sig.push('⚠️OBV顶背离');
-    } else if (d.obvDiv === 'bottom' && !isBottomRebound) {
-        s += 8;
-        sig.push('📊OBV底背离');
-    } else if (d.obv?.rising) {
-        s += 5;
-        sig.push('💧OBV能量潮上升');
-    }
-    
-    // ---- N. v3.16 新增：WR威廉背离 - 严格 ----
-    if (d.wrDiv === 'top') {
-        s -= 8;
-        sig.push('⚠️WR顶背离');
-    } else if (d.wrDiv === 'bottom' && !isBottomRebound) {
-        s += 6;
-        sig.push('📊WR底背离蓄力');
-    }
-    
-    // ---- O. v3.16 新增：市场情绪综合评分 - 收紧 ----
+    // 高级信号
+    if (d.divergence === 'top') { s -= 12; sig.push('⚠️顶背离预警'); }
+    else if (d.divergence === 'bottom' && !isBottomRebound) { s += 10; sig.push('📊底背离蓄力'); }
+    if (d.mtf?.aligned && d.mtf.direction === 'up') { core.tech += 2; s += 15; sig.push('🔄多周期看多'); }
+    else if (d.mtf?.aligned && d.mtf.direction === 'down') { s -= 10; sig.push('🔄多周期看空'); }
+    if (d.trendAccel?.strongTrend && d.trendAccel.bullish) { core.tech += 1; s += 12; sig.push('💥主升浪'); }
+    else if (d.trendAccel?.accelerating && d.trendAccel.bullish) { s += 8; sig.push('🚀趋势加速'); }
+    if (d.volBreakout?.breakout && d.volBreakout.volConfirmed) { core.tech += 2; s += 18; sig.push(`📊波动率爆发${d.volBreakout.atrRatio.toFixed(1)}x`); }
+    else if (d.volBreakout?.breakout) { s += 10; sig.push('⚡波动率放大'); }
+    if (d.maCross?.goldenCross) { core.tech += 2; s += 15; sig.push('🌟均线金叉'); }
+    else if (d.maCross?.bullish && d.maCross.strength > 2) { s += 8; sig.push('📈均线多头'); }
+    if (d.macdAccel?.accelerating) { core.tech += 1; s += 12; sig.push('💫MACD加速'); }
+    if (d.obvDiv === 'top') { s -= 10; sig.push('⚠️OBV顶背离'); }
+    else if (d.obvDiv === 'bottom' && !isBottomRebound) { s += 8; sig.push('📊OBV底背离'); }
+    else if (d.obv?.rising) { s += 5; sig.push('💧OBV上升'); }
+    if (d.wrDiv === 'top') { s -= 8; sig.push('⚠️WR顶背离'); }
+    else if (d.wrDiv === 'bottom' && !isBottomRebound) { s += 6; sig.push('📊WR底背离'); }
     if (d.sentiment) {
-        if (d.sentiment.sentiment > 75) {
-            core.tech += 1;
-            s += 10;
-            sig.push('😊市场情绪高涨');
-        } else if (d.sentiment.sentiment < 25) {
-            s -= 10;
-            sig.push('😰市场情绪低迷');
-        } else if (d.sentiment.extreme) {
-            // 极端情绪预警
-            if (d.sentiment.sentiment > 85) {
-                s -= 8;
-                sig.push('⚠️情绪过热预警');
-            } else if (d.sentiment.sentiment < 15) {
-                s += 6;
-                sig.push('🌟情绪超卖机会');
-            }
-        }
+        if (d.sentiment.sentiment > 75) { core.tech += 1; s += 10; sig.push('😊情绪高涨'); }
+        else if (d.sentiment.sentiment < 25) { s -= 10; sig.push('😰情绪低迷'); }
     }
     
-    // ---- J. 风险过滤 - 更严格 ----
+    // 风险过滤
+    if (maxChg > 8 && d.vr < 1.3) { s -= 12; sig.push('⚠️虚涨风险'); }
+    if (maxChg > 6 && d.vr >= 1.8) { s += 6; sig.push('✅量价配合'); }
     if (d.fr > 0.02) { s -= 10; sig.push('⚠️高费率风险'); }
     if (d.rsi > 68) { s -= 6; sig.push('⚠️RSI超买'); }
     if (whale < 0.75) { s -= 12; sig.push('🦈大户偏空'); }
@@ -931,25 +803,15 @@ function score(d) {
     // 限制范围
     s = Math.min(Math.max(s, 0), 130);
     
-    // ========== 4. 严格暴涨信号判定 (v3.18收紧) ==========
+    // ========== 4. 信号判定 (v3.21 精简) ==========
     const resonanceScore = core.tech * 2 + core.fund + core.whale;
-    
-    // 🚀暴涨预警：三维度共振 (共振分≥5且总分≥50)
-    if (resonanceScore >= 5 && s >= 50) {
-        level = '🚀暴涨预警';
-    } 
-    // ⚡积累中：二维共振 (共振分≥3且总分≥40)
-    else if (resonanceScore >= 3 && s >= 40) {
-        level = '⚡积累中';
-    } 
-    // 👀观察中：单维信号 (总分≥30)
-    else if (s >= 30) {
-        level = '👀观察中';
-        isWatch = true;
-    }
+    if (resonanceScore >= 5 && s >= 50) level = '🚀暴涨预警';
+    else if (resonanceScore >= 3 && s >= 40) level = '⚡积累中';
+    else if (s >= 30) { level = '👀观察中'; isWatch = true; }
     
     return { s, sig: sig.slice(0, 8), level, isBottomRebound, isWatch, isCrash, crashSignals };
 }
+
 
 // ========== 主分析流程 (v3.20 - 全信号共振版) ==========
 async function runAll() {
@@ -1024,15 +886,9 @@ async function runAll() {
                     const newVol = v4.slice(-12).reduce((a, b) => a + b) / 0;
                     const oiChg = oldVol > 0 ? ((newVol - oldVol) / oldVol) * 100 : null;
                     
-                    // 资金流向（takerBuy = 主动买入 / 总成交额）
-                    const takerBuyVol = parseFloat(t.takerBuyQuoteAssetVolume) || 0;
-                    const totalVol = parseFloat(t.quoteVolume) || 1;
-                    // 若takerBuy字段缺失，用价格涨跌幅估算
-                    const takerBuyRatio = takerBuyVol > 0 
-                        ? Math.min(Math.max(takerBuyVol / totalVol, 0.1), 0.9)
-                        : (parseFloat(t.priceChangePercent) > 0 ? 0.54 : 0.46);
-                    // 多空比：基于taker买入比例线性映射到[0.3, 2.0]区间
-                    const whaleLongShortRatio = 0.3 + (takerBuyRatio * 1.7);
+                    // 资金流向（使用公共函数）
+                    const takerBuyRatio = calcTakerRatio(t);
+                    const whaleLongShortRatio = calcWhaleRatio(takerBuyRatio);
                     
                     // 涨跌幅
                     const chg4h = c4.length >= 2 ? (c4[c4.length - 1] - c4[c4.length - 2]) / c4[c4.length - 2] * 100 : 0;
@@ -1157,12 +1013,8 @@ async function runWhale() {
         const results = tickers
             .filter(t => t.symbol.endsWith('USDT') && activeSymbols.has(t.symbol) && parseFloat(t.quoteVolume) > 5000000)
             .map(t => {
-                const takerBuyVol = parseFloat(t.takerBuyQuoteAssetVolume) || 0;
-                const totalVol = parseFloat(t.quoteVolume) || 1;
-                const takerBuyRatio = takerBuyVol > 0
-                    ? Math.min(Math.max(takerBuyVol / totalVol, 0.1), 0.9)
-                    : (parseFloat(t.priceChangePercent) > 0 ? 0.54 : 0.46);
-                const whaleLongShortRatio = 0.3 + (takerBuyRatio * 1.7);
+                const takerBuyRatio = calcTakerRatio(t);
+                const whaleLongShortRatio = calcWhaleRatio(takerBuyRatio);
 
                 return {
                     sym: t.symbol,
@@ -1264,130 +1116,42 @@ async function runFunding() {
     busy = false;
 }
 
-// ========== 统一表格渲染器 ==========
-// 表格类型配置
+// ========== 统一表格渲染器 (v3.21 精简) ==========
 const TABLE_CONFIGS = {
-    rank: {
-        headers: ['#', '币种', '价格', '24H涨跌', '成交额'],
-        renderCell: (c, i, col) => {
-            if (col === 0) return i + 1;
-            if (col === 1) return `<b>${c.sym.replace('USDT', '')}</b>`;
-            if (col === 2) return `$${fmt(c.price)}`;
-            if (col === 3) return fc(c.c24h);
-            if (col === 4) return fv(c.vol);
-        },
-        sort: null
-    },
-    funding: {
-        headers: ['#', '币种', '费率', '下次结算'],
-        renderCell: (c, i, col, extra) => {
-            if (col === 0) return i + 1;
-            if (col === 1) return `<b>${c.sym.replace('USDT', '')}</b>`;
-            if (col === 2) return `<span style="color:${extra.color};font-weight:700">${c.fr >= 0 ? '+' : ''}${fmt(c.fr, 4)}%</span>`;
-            if (col === 3) return `<span style="color:#888">${c.nextFR}</span>`;
-        },
-        color: '#ff9800'
-    },
-    soon: {
-        headers: ['#', '币种', '费率', '剩余时间'],
-        renderCell: (c, i, col, extra) => {
-            const isHigh = c.fr > 0;
-            const urgent = c.nextTs - Date.now() < 1800000;
-            if (col === 0) return i + 1;
-            if (col === 1) return `<b>${c.sym.replace('USDT', '')}</b>`;
-            if (col === 2) return `<span style="color:${isHigh ? '#ef5350' : '#26c281'};font-weight:700">${c.fr >= 0 ? '+' : ''}${fmt(c.fr, 4)}%</span>`;
-            if (col === 3) return `<span style="color:${urgent ? '#ff9800' : '#888'};font-weight:${urgent ? '700' : '400'}">${c.nextFR}${urgent ? ' ⚠️' : ''}</span>`;
-        },
-        urgent: true
-    }
+    rank: { headers: ['#', '币种', '价格', '24H涨跌', '成交额'], renderCell: (c, i, col) => col === 0 ? i + 1 : col === 1 ? `<b>${c.sym.replace('USDT', '')}</b>` : col === 2 ? `$${fmt(c.price)}` : col === 3 ? fc(c.c24h) : fv(c.vol) },
+    funding: { headers: ['#', '币种', '费率', '下次结算'], renderCell: (c, i, col, ex) => col === 0 ? i + 1 : col === 1 ? `<b>${c.sym.replace('USDT', '')}</b>` : col === 2 ? `<span style="color:${ex.color};font-weight:700">${c.fr >= 0 ? '+' : ''}${fmt(c.fr, 4)}%</span>` : `<span style="color:#888">${c.nextFR}</span>`, color: '#ff9800' },
+    soon: { headers: ['#', '币种', '费率', '剩余时间'], renderCell: (c, i, col) => { const isHigh = c.fr > 0, urgent = c.nextTs - Date.now() < 1800000; return col === 0 ? i + 1 : col === 1 ? `<b>${c.sym.replace('USDT', '')}</b>` : col === 2 ? `<span style="color:${isHigh ? '#ef5350' : '#26c281'};font-weight:700">${c.fr >= 0 ? '+' : ''}${fmt(c.fr, 4)}%</span>` : `<span style="color:${urgent ? '#ff9800' : '#888'};font-weight:${urgent ? '700' : '400'}">${c.nextFR}${urgent ? ' ⚠️' : ''}</span>`; }, urgent: true }
 };
 
-// 通用表格渲染
 function renderTable(id, data, type = 'rank', extra = {}) {
     const el = $(id);
-    if (!data || !data.length) { 
-        el.innerHTML = '<p style="color:#666;text-align:center;padding:20px">暂无数据</p>'; 
-        return; 
-    }
-    
-    const config = TABLE_CONFIGS[type] || TABLE_CONFIGS.rank;
+    if (!data || !data.length) { el.innerHTML = '<p style="color:#666;text-align:center;padding:20px">暂无数据</p>'; return; }
+    const cfg = TABLE_CONFIGS[type] || TABLE_CONFIGS.rank;
     const rows = data.map((c, i) => {
-        const urgent = config.urgent && c.nextTs - Date.now() < 1800000;
-        const cells = config.headers.map((_, col) => {
-            const val = config.renderCell(c, i, col, { ...config, ...extra });
-            return `<td>${val}</td>`;
-        }).join('');
+        const urgent = cfg.urgent && c.nextTs - Date.now() < 1800000;
+        const cells = cfg.headers.map((_, col) => `<td>${cfg.renderCell(c, i, col, { ...cfg, ...extra })}</td>`).join('');
         return `<tr${urgent ? ' style="background:rgba(255,152,0,.1)"' : ''}>${cells}</tr>`;
     });
-    
-    el.innerHTML = `<table>
-        <tr>${config.headers.map(h => `<th>${h}</th>`).join('')}</tr>
-        ${rows.join('')}
-    </table>`;
+    el.innerHTML = `<table><tr>${cfg.headers.map(h => `<th>${h}</th>`).join('')}</tr>${rows.join('')}</table>`;
 }
+const renderRankTable = (id, data) => renderTable(id, data, 'rank');
+const renderFundingTable = (id, coins) => renderTable(id, coins, 'funding', { color: id === 'highFunding' ? '#ef5350' : '#26c281' });
+const renderSoonTable = (id, coins) => renderTable(id, coins, 'soon');
 
-// 涨跌榜表格 (兼容旧API)
-function renderRankTable(id, data, isLoser) {
-    renderTable(id, data, 'rank');
-}
-
-// 费率表格 (兼容旧API)
-function renderFundingTable(id, coins) {
-    renderTable(id, coins, 'funding', { color: id === 'highFunding' ? '#ef5350' : '#26c281' });
-}
-
-// 即将清算表格 (兼容旧API)
-function renderSoonTable(id, coins) {
-    renderTable(id, coins, 'soon');
-}
-
-// ========== 统一卡片渲染器 (v3.14) ==========
-// 卡片样式配置
-const CARD_CONFIG = {
-    rebound: { border: '#00e676', label: '🔼底部反弹', scoreClass: 's-h' },
-    crash: { border: '#ef5350', label: '', scoreClass: 's-crash' },
-    hotTrend: { border: '#ff9800', label: '🔥HOT', scoreClass: 's-hot' },
-    whale: { border: '#00bcd4', label: '', scoreClass: 's-whale' },
-    default: { border: '', label: '', scoreClass: '' }
-};
-
-// 评分样式
-const LEVEL_CLASS = {
-    '🚀暴涨预警': 's-h', '⚡积累中': 's-w', '👀观察中': 's-c'
-};
-
-// 指标箭头
-const getArrow = (val, type = 'neutral') => {
-    const n = parseFloat(val) || 0;
-    if (type === 'crash') return n > 70 ? '🔴' : '';
-    if (type === 'rsi') return n > 55 ? '🔴' : (n < 35 ? '🟢' : '');
-    if (type === 'kdj') return n > 80 ? '🔴' : (n < 20 ? '🟢' : '');
-    if (type === 'cci') return n > 100 ? '🔴' : (n < -100 ? '🟢' : '');
-    return '';
-};
-
-// 标签样式
-const tagClass = s => {
-    if (s.includes('⚠️')) return 'tag-r';
-    if (s.includes('🐋') || s.includes('🦈')) return 'tag-whale';
-    return '';
-};
-
-// 通用卡片渲染
+// ========== 统一卡片渲染器 (v3.21 精简) ==========
 function renderCard(c, styleKey = '') {
-    const cfg = CARD_CONFIG[styleKey] || CARD_CONFIG.default;
+    const cfg = CARD_CONFIG[styleKey] || {};
     const isCrash = c.isCrash, isRebound = c.isBottomRebound;
-    const border = isCrash ? '#ef5350' : (isRebound ? '#00e676' : cfg.border);
+    const border = isCrash ? '#ef5350' : (isRebound ? '#00e676' : cfg.border || '');
     const scoreClass = isCrash ? 's-crash' : (isRebound ? 's-h' : (cfg.scoreClass || LEVEL_CLASS[c.level] || 's-n'));
-    const scoreText = styleKey === 'hotTrend' ? '🔥HOT' : 
-                      (c.whaleLongShortRatio ? `${c.whaleLongShortRatio.toFixed(1)}x` : `${c.s}分`);
+    const scoreText = styleKey === 'hotTrend' ? '🔥HOT' : (c.whaleLongShortRatio ? `${c.whaleLongShortRatio.toFixed(1)}x` : `${c.s}分`);
     
     return `<div class="card" style="border-color:${border}">
         <div class="card-hd">
             <div><span class="name">${c.sym.replace('USDT', '')}</span><span class="price">$${fmt(c.price)}</span></div>
             <div style="text-align:right">
                 <span class="score ${scoreClass}">${scoreText}</span>
-                ${cfg.label ? `<div style="font-size:.7em;color:${cfg.border || '#888'};margin-top:2px">${cfg.label}</div>` : ''}
+                ${cfg.label ? `<div style="font-size:.7em;color:${cfg.border};margin-top:2px">${cfg.label}</div>` : ''}
             </div>
         </div>
         <div class="info">
@@ -1410,49 +1174,35 @@ function renderCard(c, styleKey = '') {
         <div class="tags">${(c.sig || []).map(s => `<span class="tag ${tagClass(s)}">${s}</span>`).join('')}</div>
     </div>`;
 }
-
-// 统一卡片列表
 function renderCards(id, coins, styleKey = '') {
-    $(id).innerHTML = coins.length 
-        ? coins.map(c => renderCard(c, styleKey)).join('') 
-        : '<p style="color:#666;text-align:center;padding:20px">暂无</p>';
+    $(id).innerHTML = coins.length ? coins.map(c => renderCard(c, styleKey)).join('') : '<p style="color:#666;text-align:center;padding:20px">暂无</p>';
 }
 
-// 大户卡片 (v3.20 整合Taker主动买入数据)
+// 大户卡片 (v3.21 精简)
 function renderWhaleCards(id, coins) {
     const renderWhale = c => {
-        // 使用takerBuyRatio估算大户倾向
         const tbr = c.takerBuyRatio ? parseFloat(c.takerBuyRatio) / 100 : 0.5;
         const r = c.whaleLongShortRatio || 1;
         const lsColor = tbr > 0.52 ? '#00e676' : tbr < 0.48 ? '#ef5350' : '#ff9800';
-        const level = tbr > 0.52 ? '📈大户偏多' : tbr < 0.48 ? '📉大户偏空' : '⚖️中性';
-
-        // 做多/做空账户估算（基于taker买入比率）
+        const level = tbr > 0.52 ? '📈偏多' : tbr < 0.48 ? '📉偏空' : '⚖️中性';
         const acLong = tbr > 0.1 ? Math.min(Math.max((tbr - 0.3) * 200, 20), 80).toFixed(1) : null;
         const acShort = tbr > 0.1 ? Math.min(Math.max((0.7 - tbr) * 200, 20), 80).toFixed(1) : null;
-        // 做多/做空持仓
         const posLong = tbr > 0.1 ? Math.min(Math.max((tbr - 0.2) * 150, 25), 75).toFixed(1) : null;
         const posShort = tbr > 0.1 ? Math.min(Math.max((0.8 - tbr) * 150, 25), 75).toFixed(1) : null;
-
-        // 评分显示
-        const scoreText = `${(tbr * 100).toFixed(0)}%`;
         const scoreClass = tbr > 0.52 ? 's-h' : tbr < 0.48 ? 's-crash' : 's-w';
-
-        // 涨跌箭头
-        const rsiColor = c.rsi && parseFloat(c.rsi) > 50 ? '🔴' : '🔵';
 
         return `<div class="card" style="border-color:#00bcd4">
             <div class="card-hd">
                 <div><span class="name">${c.sym.replace('USDT', '')}</span><span class="price">$${fmt(c.price)}</span></div>
                 <div style="text-align:right">
-                    <span class="score ${scoreClass}">${scoreText}</span>
+                    <span class="score ${scoreClass}">${(tbr * 100).toFixed(0)}%</span>
                     <div style="font-size:.7em;color:${lsColor};margin-top:2px">${level}</div>
                 </div>
             </div>
             <div class="info">
                 <div class="row"><span class="lbl">4H</span>${fc(c.chg4h)}</div>
                 <div class="row"><span class="lbl">24H</span>${fc(c.c24h)}</div>
-                <div class="row"><span class="lbl">RSI</span>${c.rsi || '-'} ${rsiColor}</div>
+                <div class="row"><span class="lbl">RSI</span>${c.rsi || '-'}</div>
                 <div class="row"><span class="lbl">KDJ</span>${c.kdj || '-'}</div>
                 <div class="row"><span class="lbl">费率</span>${fmt(c.fr, 4)}%</div>
                 <div class="row"><span class="lbl">评分</span>${c.s || 0}分</div>
@@ -1467,10 +1217,7 @@ function renderWhaleCards(id, coins) {
             <div class="tags">${(c.sig || []).map(s => `<span class="tag tag-whale">${s}</span>`).join('')}</div>
         </div>`;
     };
-
-    $(id).innerHTML = coins.length
-        ? coins.map(renderWhale).join('')
-        : '<p style="color:#666;text-align:center;padding:20px">暂无大户数据</p>';
+    $(id).innerHTML = coins.length ? coins.map(renderWhale).join('') : '<p style="color:#666;text-align:center;padding:20px">暂无大户数据</p>';
 }
 
 function showTab(id) {
@@ -1487,7 +1234,7 @@ function showTab(id) {
 
 // ========== 初始化 ==========
 window.onload = function() {
-    console.log('🚀 币安合约预警系统 v3.20 已加载');
+    console.log('🚀 币安合约预警系统 v3.21 已加载');
     
     // 绑定按钮事件
     $('btnRun').onclick = function() { runAll(); };
