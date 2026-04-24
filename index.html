@@ -2387,7 +2387,7 @@ async function runOIChange() {
                     }
                 } catch(e) {}
             }));
-            if (i + BATCH < validTickers.length) await sleep(100);
+            if (i + BATCH < validTickers.length) await new Promise(r => setTimeout(r, 100));
             $('bar').style.width = Math.min(i + BATCH, validTickers.length) / validTickers.length * 100 + '%';
         }
 
