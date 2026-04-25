@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>币安合约暴涨预警系统 v3.39</title>
+    <title>币安合约暴涨预警系统 v3.40</title>
     <style>
         *{margin:0;padding:0;box-sizing:border-box}
         body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;background:linear-gradient(135deg,#0f0f1a,#1a1a2e);min-height:100vh;color:#e0e0e0}
@@ -2540,10 +2540,16 @@ async function runFuturesOnly() {
                 .map(s => s.baseAsset.toUpperCase())
         );
 
-        // 合约活跃USDT永续合约 baseAsset 集合
+        // 合约活跃USDT永续合约 baseAsset 集合（过滤快下架的合约）
         const futActiveSet = new Set(
             futInfo.symbols
-                .filter(s => s.status === 'TRADING' && s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT')
+                .filter(s =>
+                    s.status === 'TRADING' &&
+                    s.contractType === 'PERPETUAL' &&
+                    s.quoteAsset === 'USDT' &&
+                    // deliveryDate > 0 意味着即将转交割/下架，排除
+                    (!s.deliveryDate || parseInt(s.deliveryDate) === 0)
+                )
                 .map(s => s.baseAsset.toUpperCase())
         );
 
